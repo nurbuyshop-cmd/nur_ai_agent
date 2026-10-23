@@ -1,0 +1,12 @@
+# Hide folder listings and private files
+Options -Indexes
+DirectoryIndex index.php
+
+<FilesMatch "\.(md|sqlite|sqlite-wal|sqlite-shm|log)$">
+    <IfModule mod_authz_core.c>
+        Require all denied
+    </IfModule>
+    <IfModule !mod_authz_core.c>
+        Deny from all
+    </IfModule>
+</FilesMatch>

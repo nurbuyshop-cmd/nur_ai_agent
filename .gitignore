@@ -1,0 +1,6 @@
+# secrets: the real settings live only on the server
+app/config.php
+# conversations, logs and caches
+app/data/*
+!app/data/.htaccess
+.DS_Store
