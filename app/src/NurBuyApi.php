@@ -195,31 +195,89 @@ final class NurBuyApi
     // Districts
     // ------------------------------------------------------------------
 
-    /** [[id, name, bn, fee, eta], ...] from GET /geo. */
+    /** [[id, name, bn, fee, eta, cod], ...] from GET /geo (cod: 1 = cash on delivery offered there). */
     public static function districts(): array
     {
-        return self::cached('geo', self::GEO_TTL, static function (): array {
+        return self::geo()['d'];
+    }
+
+    /** Thanas of a district from GET /geo: [[id, name, bn], ...] (empty on an older API). */
+    public static function thanas(int $district): array
+    {
+        $u = self::geo()['u'];
+        return is_array($u[(string) $district] ?? null) ? $u[(string) $district] : [];
+    }
+
+    private static function geo(): array
+    {
+        return self::cached('geo2', self::GEO_TTL, static function (): array {
             $res = Http::get(self::base() . '/geo', ['Accept: application/json'], 20);
             $list = $res['json']['min']['d'] ?? null;
             if ($res['status'] !== 200 || !is_array($list)) {
                 throw new RuntimeException('District list error ' . $res['status']);
             }
-            return $list;
+            $u = $res['json']['min']['u'] ?? [];
+            return ['d' => $list, 'u' => is_array($u) ? $u : []];
         });
+    }
+
+    /** Cash on delivery offered in this district (older APIs send no flag: yes). */
+    public static function codOk(int $district): bool
+    {
+        foreach (self::districts() as $d) {
+            if ((int) $d[0] === $district) {
+                return !isset($d[5]) || (int) $d[5] === 1;
+            }
+        }
+        return true;
+    }
+
+    /** Same Bangla letters in one form (য় typed as one letter or as য + ়). */
+    private static function nfc(string $x): string
+    {
+        return class_exists('Normalizer') ? (string) (Normalizer::normalize($x, Normalizer::FORM_C) ?: $x) : $x;
+    }
+
+    /** Matches a thana / upazila of the district, written in English or Bangla. */
+    public static function findThana(int $district, string $text): ?array
+    {
+        $clean = static fn(string $x) => str_replace([' ', '-', '.'], '', mb_strtolower(trim(
+            preg_replace('/(^|\s)(thana|upazila|upozila|sadar|থানা|উপজেলা|সদর)(?=\s|$)/iu', ' ', self::nfc($x)))));
+        $want = $clean($text);
+        if ($want === '') {
+            return null;
+        }
+        $hit = null;
+        foreach (self::thanas($district) as $t) {
+            $en = $clean((string) $t[1]);
+            $bn = $clean((string) $t[2]);
+            if ($want === $en || $want === $bn) {
+                return ['id' => (int) $t[0], 'name' => (string) $t[1], 'bn' => (string) $t[2]];
+            }
+            // "Sadar" style names: "Comilla Sadar" -> "comilla"
+            if ($hit === null && $en !== '' && (str_starts_with($en, $want) || str_starts_with($want, $en)) && min(mb_strlen($en), mb_strlen($want)) >= 4) {
+                $hit = ['id' => (int) $t[0], 'name' => (string) $t[1], 'bn' => (string) $t[2]];
+            }
+        }
+        return $hit;
     }
 
     /** Matches a district written in English or Bangla. */
     public static function findDistrict(string $text): ?array
     {
         $want = mb_strtolower(trim(preg_replace('/\s*(district|jela|zila|জেলা)\s*$/iu', '', trim($text))));
-        $want = self::DISTRICT_ALIASES[$want] ?? $want;
         if ($want === '') {
             return null;
         }
+        // Old and new spellings both work (Comilla / Cumilla), whichever one the website uses.
+        $want  = self::nfc($want);
+        $wants = array_unique(array_filter([$want, self::DISTRICT_ALIASES[$want] ?? '', array_search($want, self::DISTRICT_ALIASES, true) ?: '']));
         foreach (self::districts() as $d) {
             $en = mb_strtolower((string) $d[1]);
-            if ($want === $en || $want === (string) $d[2] || str_replace(' ', '', $want) === str_replace(' ', '', $en)) {
-                return ['id' => (int) $d[0], 'name' => (string) $d[1], 'bn' => (string) $d[2]];
+            foreach ($wants as $w) {
+                if ($w === $en || $w === self::nfc((string) $d[2]) || str_replace(' ', '', $w) === str_replace(' ', '', $en)) {
+                    return ['id' => (int) $d[0], 'name' => (string) $d[1], 'bn' => (string) $d[2]];
+                }
             }
         }
         return null;
@@ -254,6 +312,16 @@ final class NurBuyApi
         $dist = self::findDistrict($district);
         if (!$dist) {
             return ['ok' => false, 'error' => 'unknown_district: ask the customer which of the 64 districts the address is in'];
+        }
+        if (!self::codOk($dist['id'])) {
+            return ['ok' => false, 'error' => 'cod_unavailable: cash on delivery is not offered in ' . $dist['name']
+                . '. Chat orders are cash on delivery only, so tell the customer politely and give the product link to order on the website,'
+                . ' where they can pay by bKash, Nagad or Rocket.'];
+        }
+        $th = self::findThana($dist['id'], $thana);
+        if ($th) {
+            $thana = $th['name'];
+            $address = implode(', ', array_filter([trim($details), trim($postOffice) !== '' ? 'Post office: ' . trim($postOffice) : '', 'Thana: ' . $th['bn'] . ' (' . $th['name'] . ')'], static fn($x) => $x !== ''));
         }
         if (!$items || count($items) > 10) {
             return ['ok' => false, 'error' => 'items_required'];
@@ -315,6 +383,7 @@ final class NurBuyApi
             'name'     => trim($name),
             'mobile'   => $mobile,
             'district' => $dist,
+            'thana'    => $th,
             'address'  => trim($address),
             'sub'      => round($sub, 2),
             'fee'      => $fee,
@@ -334,6 +403,9 @@ final class NurBuyApi
             'address'  => $quote['address'],
             'items'    => $quote['items'],
         ];
+        if (!empty($quote['thana']['id'])) {
+            $payload['thana'] = $quote['thana']['id'];
+        }
         $res = Http::postJson(self::base() . '/bot/orders', $payload, self::botHeaders($channel), 30);
         if ($res['status'] === 201 && isset($res['json']['order']['id'])) {
             $o = $res['json']['order'];
